@@ -24,7 +24,23 @@ export interface Dispute {
   reason: string;
   openedAt: string;
   freelancerBps?: number;
+  toFreelancer?: number;
+  toClient?: number;
   resolvedAt?: string;
+}
+
+export interface Settlement {
+  kind: 'cancel' | 'dispute';
+  toFreelancer: number;
+  toClient: number;
+  at: string;
+}
+
+export interface LedgerEntry {
+  type: 'deposit' | 'release' | 'dispute_payout' | 'refund';
+  amount: number;
+  milestoneIndex?: number;
+  at: string;
 }
 
 export interface EscrowContract {
@@ -36,12 +52,15 @@ export interface EscrowContract {
   milestones: Milestone[];
   totalAmount: number;
   fundedAmount: number;
+  depositedAmount: number;
   releasedAmount: number;
+  refundedAmount: number;
   status: ContractStatus;
   reputationIssued: boolean;
   dispute?: Dispute;
   createdAt: string;
   updatedAt: string;
+  settlement?: Settlement;
 }
 
 export interface Reputation {
@@ -63,6 +82,17 @@ export class HttpError extends Error {
 
 const MAX_MILESTONES = 20;
 const ACTIVE: ContractStatus[] = ['Created', 'Funded'];
+
+function assertBalanced(c: EscrowContract): void {
+  const escrow = c.fundedAmount - c.releasedAmount;
+  const expected = c.releasedAmount + c.refundedAmount + escrow;
+  if (c.depositedAmount !== expected) {
+    throw new Error(
+      `ledger imbalance for contract ${c.id}: deposited=${c.depositedAmount} ` +
+        `released=${c.releasedAmount} refunded=${c.refundedAmount} escrow=${escrow}`,
+    );
+  }
+}
 
 export class EscrowStore {
   private contracts = new Map<number, EscrowContract>();
@@ -126,7 +156,9 @@ export class EscrowStore {
       milestones,
       totalAmount: milestones.reduce((s, m) => s + m.amount, 0),
       fundedAmount: 0,
+      depositedAmount: 0,
       releasedAmount: 0,
+      refundedAmount: 0,
       status: 'Created',
       reputationIssued: false,
       createdAt: now,
@@ -158,7 +190,9 @@ export class EscrowStore {
       throw new HttpError(409, 'over_funded', 'deposit exceeds contract total');
     }
     c.fundedAmount += amount;
+    c.depositedAmount += amount;
     if (c.fundedAmount === c.totalAmount) c.status = 'Funded';
+    assertBalanced(c);
     return this.touch(c);
   }
 
@@ -174,6 +208,7 @@ export class EscrowStore {
     m.released = true;
     c.releasedAmount += m.amount;
     if (c.milestones.every((x) => x.released)) c.status = 'Completed';
+    assertBalanced(c);
     return this.touch(c);
   }
 
@@ -189,6 +224,7 @@ export class EscrowStore {
       reason: typeof reason === 'string' && reason ? reason : 'No reason given',
       openedAt: new Date().toISOString(),
     };
+    assertBalanced(c);
     return this.touch(c);
   }
 
@@ -203,19 +239,31 @@ export class EscrowStore {
     }
     const held = c.fundedAmount - c.releasedAmount;
     const toFreelancer = Math.floor((held * bps) / 10_000);
+    const toClient = held - toFreelancer;
+    const at = new Date().toISOString();
     c.releasedAmount += toFreelancer;
+    c.refundedAmount += toClient;
     c.fundedAmount = c.releasedAmount;
     c.status = 'Resolved';
     c.dispute.freelancerBps = bps;
-    c.dispute.resolvedAt = new Date().toISOString();
+    c.dispute.toFreelancer = toFreelancer;
+    c.dispute.toClient = toClient;
+    c.dispute.resolvedAt = at;
+    c.settlement = { kind: 'dispute', toFreelancer, toClient, at };
+    assertBalanced(c);
     return this.touch(c);
   }
 
   cancel(id: number): EscrowContract {
     const c = this.get(id);
     this.requireActive(c);
+    const toClient = c.fundedAmount - c.releasedAmount;
+    const at = new Date().toISOString();
+    c.refundedAmount += toClient;
     c.fundedAmount = c.releasedAmount;
     c.status = 'Cancelled';
+    c.settlement = { kind: 'cancel', toFreelancer: 0, toClient, at };
+    assertBalanced(c);
     return this.touch(c);
   }
 
@@ -240,6 +288,41 @@ export class EscrowStore {
     return this.getReputation(c.freelancer);
   }
 
+  ledger(id: number): LedgerEntry[] {
+    const c = this.get(id);
+    const entries: LedgerEntry[] = [];
+    if (c.depositedAmount > 0) {
+      entries.push({ type: 'deposit', amount: c.depositedAmount, at: c.createdAt });
+    }
+    for (const m of c.milestones) {
+      if (m.released) {
+        entries.push({
+          type: 'release',
+          amount: m.amount,
+          milestoneIndex: m.index,
+          at: c.updatedAt,
+        });
+      }
+    }
+    if (c.settlement) {
+      if (c.settlement.kind === 'dispute') {
+        if (c.settlement.toFreelancer > 0) {
+          entries.push({
+            type: 'dispute_payout',
+            amount: c.settlement.toFreelancer,
+            at: c.settlement.at,
+          });
+        }
+        if (c.settlement.toClient > 0) {
+          entries.push({ type: 'refund', amount: c.settlement.toClient, at: c.settlement.at });
+        }
+      } else if (c.settlement.toClient > 0) {
+        entries.push({ type: 'refund', amount: c.settlement.toClient, at: c.settlement.at });
+      }
+    }
+    return entries;
+  }
+
   getReputation(address: string): Reputation {
     const r = this.reputation.get(address) ?? { completed: 0, total: 0 };
     return {
@@ -254,11 +337,23 @@ export class EscrowStore {
     const all = this.list();
     const byStatus: Record<string, number> = {};
     for (const c of all) byStatus[c.status] = (byStatus[c.status] ?? 0) + 1;
+    const releasedViaMilestones = all.reduce(
+      (s, c) => s + c.milestones.reduce((ms, m) => ms + (m.released ? m.amount : 0), 0),
+      0,
+    );
+    const releasedViaDisputes = all.reduce(
+      (s, c) => s + (c.settlement?.kind === 'dispute' ? c.settlement.toFreelancer : 0),
+      0,
+    );
     return {
       contracts: all.length,
       byStatus,
       totalEscrowed: all.reduce((s, c) => s + (c.fundedAmount - c.releasedAmount), 0),
-      totalReleased: all.reduce((s, c) => s + c.releasedAmount, 0),
+      totalDeposited: all.reduce((s, c) => s + c.depositedAmount, 0),
+      totalRefunded: all.reduce((s, c) => s + c.refundedAmount, 0),
+      totalReleased: releasedViaMilestones + releasedViaDisputes,
+      releasedViaMilestones,
+      releasedViaDisputes,
     };
   }
 
