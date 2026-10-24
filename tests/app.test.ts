@@ -158,8 +158,8 @@ describe('TalentTrust API', () => {
         }
       }
       const final = store.get(c.id);
-      const ledger = store.getLedger(c.id);
-      const depositSum = ledger.filter(e => e.type === 'deposit').reduce((s, e) => s + e.amount, 0);
+      const ledger = store.ledger(c.id);
+      const depositSum = ledger.filter((e: { type: string }) => e.type === 'deposit').reduce((s: number, e: { amount: number }) => s + e.amount, 0);
       expect(depositSum).toBe(final.depositedAmount);
       expect(final.depositedAmount).toBe(final.releasedAmount + final.refundedAmount + (final.fundedAmount - final.releasedAmount));
     }

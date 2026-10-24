@@ -175,8 +175,8 @@ export class EscrowStore {
 
     const hasBig = milestones.some((m) => typeof m.amount === 'string');
     const totalAmount = hasBig
-      ? milestones.reduce((s, m) => s + BigInt(m.amount), 0n).toString()
-      : milestones.reduce((s, m) => s + Number(m.amount), 0);
+      ? milestones.reduce<bigint>((s, m) => s + BigInt(m.amount), 0n).toString()
+      : milestones.reduce<number>((s, m) => s + Number(m.amount), 0);
 
     const now = new Date().toISOString();
     const c: EscrowContract = {
@@ -311,14 +311,16 @@ export class EscrowStore {
     const toFreelancer = Math.floor((held * bps) / 10_000);
     const toClient = held - toFreelancer;
     const at = new Date().toISOString();
-    c.releasedAmount += toFreelancer;
-    c.refundedAmount += toClient;
+    c.releasedAmount = Number(c.releasedAmount) + toFreelancer;
+    c.refundedAmount = Number(c.refundedAmount) + toClient;
     c.fundedAmount = c.releasedAmount;
     c.status = 'Resolved';
-    c.dispute.freelancerBps = bps;
-    c.dispute.toFreelancer = toFreelancer;
-    c.dispute.toClient = toClient;
-    c.dispute.resolvedAt = at;
+    if (c.dispute) {
+      c.dispute.freelancerBps = bps;
+      c.dispute.toFreelancer = toFreelancer;
+      c.dispute.toClient = toClient;
+      c.dispute.resolvedAt = at;
+    }
     c.settlement = { kind: 'dispute', toFreelancer, toClient, at };
     assertBalanced(c);
     return this.touch(c);
